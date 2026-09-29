@@ -156,6 +156,17 @@ const (
 	ResolverBootstrapDomain = "full:" + ResolverFrontingHost
 )
 
+// PoisonedAnswerPrefixes are ranges a filtered resolver answers with instead of
+// the real address.
+//
+// 10.10.34.0/24 is what this network returns for Discord's gateway, and
+// 2001:4188:2:600::/64 is the IPv6 equivalent. Both are private space, so
+// nothing is listening and every connection to them hangs rather than failing,
+// which is the worst way for a block to present itself: it looks like slowness.
+// Refusing them up front turns it into an immediate failure that can be
+// attributed.
+var PoisonedAnswerPrefixes = []string{"10.10.34.0/24", "2001:4188:2:600::/64"}
+
 // dns builds the resolver block.
 //
 // Three resolvers with different jobs:
@@ -186,32 +197,46 @@ func dns(fakednsDomains []string) DNS {
 		UseSystemHosts: true,
 		ServeStale:     true,
 	}
-	// The bootstrap entry is unconditional and comes first. It is the one
-	// fakedns entry that is not a user rule, and dropping it on the grounds
-	// that "fakedns should only cover selected domains" is exactly the
-	// mistake that leaves every unselected destination unresolvable.
-	domains := make([]string, 0, len(fakednsDomains)+1)
-	domains = append(domains, ResolverBootstrapDomain)
-	for _, d := range fakednsDomains {
-		if d != ResolverBootstrapDomain {
-			domains = append(domains, d)
-		}
-	}
-	fakednsDomains = domains
+	// fakedns carries the resolver's own fronting target and nothing else.
+	//
+	// It must NOT carry the user's domains. Those are resolved through the
+	// fronted DoH resolver, which is the only resolver here that can be trusted
+	// on a filtered network. Listing them in fakedns moved those lookups onto
+	// domestic-dns, which is the system resolver, and the system resolver is
+	// what returns poisoned answers: gateway.discord.gg came back as
+	// 10.10.34.36, a private address nothing is listening on.
+	//
+	// The reference configurations do not list application domains in fakedns
+	// either, for the same reason.
+	//
+	// The one entry that is not a user rule is the bootstrap, without which the
+	// DoH resolver cannot resolve its own fronting target and every lookup times
+	// out. Those two failure modes look similar from the outside and have
+	// opposite fixes, which is why both are spelled out here.
+	bootstrap := []string{ResolverBootstrapDomain}
+
 	d.Servers = []DNSServer{
-		{Address: "fakedns", Domains: fakednsDomains},
+		{Address: "fakedns", Domains: bootstrap},
 		{
+			// No domain filter, so this is the resolver that handles the user's
+			// domains. It is the only one reached through domain fronting, and
+			// the routing ladder sends its own traffic through the fragmentation
+			// outbound.
 			Tag:       "no-filter-dns",
 			Address:   "https://cloudflare-dns.com/dns-query",
 			TimeoutMs: 12000,
-			// FinalQuery stops other resolvers also answering, which would
+			// FinalQuery stops the system resolver also answering, which would
 			// otherwise let a poisoned answer win the race.
 			FinalQuery: true,
 		},
 		{
+			// The system resolver, restricted to the same small set as fakedns
+			// so it can never answer for a user domain. On a filtered network
+			// its answers are not trustworthy, which is the whole reason the
+			// resolver above exists.
 			Tag:        "domestic-dns",
 			Address:    "localhost",
-			Domains:    fakednsDomains,
+			Domains:    bootstrap,
 			TimeoutMs:  12000,
 			FinalQuery: true,
 		},
@@ -394,6 +419,24 @@ func noiseLayers(prof model.Profile) []FinalMaskLayer {
 // routed to a direct outbound leaves with the real source address either way.
 func routingRules(cfg *model.Config, fragTCP, fragUDP, tunnelTCP, tunnelUDP []string, hasFrag bool) []RoutingRule {
 	var rules []RoutingRule
+
+	// Known-poisoned answer ranges, refused before anything else is considered.
+	//
+	// A filtered resolver answers a blocked name with an address in private
+	// space. 10.10.34.36 is the address this network returns for Discord's
+	// gateway, and nothing is listening on it, so a connection to it hangs until
+	// it times out rather than failing at once. Blocking the range turns a
+	// fifteen-second stall into an immediate, attributable failure — and an
+	// immediate failure is what makes the real cause visible, where a stall just
+	// looks like a slow network.
+	//
+	// Carried from the reference configurations. Kept unconditional and first,
+	// because a poisoned answer is worse than no answer: it looks like a working
+	// resolution all the way to the dial.
+	rules = append(rules, RoutingRule{
+		OutboundTag: TagBlock,
+		IP:          append([]string(nil), PoisonedAnswerPrefixes...),
+	})
 
 	if cfg.BlockAds && cfg.WithGeo {
 		rules = append(rules, RoutingRule{

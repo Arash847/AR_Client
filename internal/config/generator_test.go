@@ -396,12 +396,24 @@ func TestFrontedResolverHostMatchesBootstrap(t *testing.T) {
 	}
 }
 
-// TestFakednsCoversSelectedOnly is what makes selective capture work.
+// TestFakednsExcludesUserDomains is the inverse of what this test used to assert,
+// and the change is worth reading carefully.
 //
-// fakedns must answer selected domains and nothing else. Widening it puts
-// unselected traffic into the tunnel, which is the opposite of the requirement
-// and turns a proxy problem into a total outage.
-func TestFakednsCoversSelectedOnly(t *testing.T) {
+// fakedns must carry the resolver's own fronting target and nothing else. A
+// rule's domains are resolved through the fronted DoH resolver, which is the
+// only resolver here that can be trusted on a filtered network.
+//
+// Listing user domains in fakedns moved their lookups onto domestic-dns, which
+// is the system resolver. On this network that resolver answers Discord's
+// gateway with 10.10.34.36, a private address nothing is listening on, so every
+// Discord connection hung for the full timeout. The reference configurations
+// do not list application domains in fakedns either.
+//
+// Note the two failure modes look alike from the outside and have opposite
+// fixes: dropping the bootstrap entry times out every lookup, while adding user
+// domains times out exactly the destinations the user asked for. Only the second
+// looks like a partial outage, which is what made it hard to see.
+func TestFakednsExcludesUserDomains(t *testing.T) {
 	x := gen(t, func(c *model.Config) {
 		c.Rules = []model.Rule{
 			{Name: "frag", Mode: model.ModeFrag, Transport: model.TransportBoth, Enabled: true, Domains: []string{"discord.com"}},
@@ -410,19 +422,90 @@ func TestFakednsCoversSelectedOnly(t *testing.T) {
 		}
 	})
 
-	fake := x.DNS.Servers[0]
-	pool, domains := fakeAddress(t, x, fake)
+	pool, domains := fakeAddress(t, x, x.DNS.Servers[0])
 	if pool != model.DefaultFakednsPool {
 		t.Errorf("fakedns pool = %q, want %q", pool, model.DefaultFakednsPool)
 	}
-	if !contains(domains, "discord.com") {
-		t.Errorf("fakedns does not cover the frag domain: %v", domains)
+	for _, d := range domains {
+		if d != ResolverBootstrapDomain {
+			t.Errorf("fakedns carries %q; only the resolver's fronting target belongs "+
+				"there, everything else resolves through the DoH resolver", d)
+		}
 	}
-	if !contains(domains, "web.telegram.org") {
-		t.Errorf("fakedns does not cover the tunnel domain: %v", domains)
+	if !contains(domains, ResolverBootstrapDomain) {
+		t.Errorf("fakedns has lost its bootstrap entry: %v", domains)
 	}
-	if contains(domains, "example.ir") {
-		t.Errorf("fakedns covers a direct rule, which would pull bypassed traffic into the tunnel: %v", domains)
+
+	// The user's domains must be handled by the fronted resolver, which is the
+	// only one with no domain filter.
+	for i, s := range x.DNS.Servers {
+		if s.Tag == "no-filter-dns" {
+			if len(s.Domains) != 0 {
+				t.Errorf("no-filter-dns has a domain filter %v, so it cannot answer for "+
+					"the user's domains", s.Domains)
+			}
+			return
+		}
+		_ = i
+	}
+	t.Error("no server is tagged no-filter-dns")
+}
+
+// TestSystemResolverCannotAnswerForUserDomains is the other half of the same
+// guarantee. domestic-dns is the system resolver, and on a filtered network its
+// answers are not trustworthy; it is restricted to the same set as fakedns so
+// it can never be the one that answers a user domain.
+func TestSystemResolverCannotAnswerForUserDomains(t *testing.T) {
+	x := gen(t, nil)
+	for _, s := range x.DNS.Servers {
+		if s.Address != "localhost" {
+			continue
+		}
+		for _, d := range s.Domains {
+			if d != ResolverBootstrapDomain {
+				t.Errorf("the system resolver would answer for %q; its answers are what "+
+					"the poisoned gateway address comes from", d)
+			}
+		}
+	}
+}
+
+// TestPoisonedAnswerRangesAreBlocked checks the guard that turns a poisoned
+// answer from a hang into a failure.
+//
+// A blocked name answered with a private address produces a connection that
+// hangs until it times out, because nothing is listening. Fifteen seconds of
+// apparent slowness is much harder to attribute than an immediate refusal, and
+// the immediate refusal is what makes the poisoning visible at all.
+func TestPoisonedAnswerRangesAreBlocked(t *testing.T) {
+	x := gen(t, nil)
+	if len(x.Routing.Rules) == 0 {
+		t.Fatal("no routing rules")
+	}
+	first := x.Routing.Rules[0]
+	if first.OutboundTag != TagBlock {
+		t.Errorf("the first rule routes to %q, want a block: a poisoned answer has to be "+
+			"refused before anything else is considered", first.OutboundTag)
+	}
+	for _, want := range PoisonedAnswerPrefixes {
+		if !contains(first.IP, want) {
+			t.Errorf("the leading block rule is missing %q; have %v", want, first.IP)
+		}
+	}
+}
+
+// TestPoisonedBlockHasNoAddressCondition keeps the guard unconditional.
+//
+// With a hostname destination the core does not resolve, so an address-scoped
+// rule that also carries a domain or port condition is fine, but one carrying
+// no condition at all is what catches the dial to a literal poisoned address
+// that arrives with no domain to match on.
+func TestPoisonedBlockHasNoAddressCondition(t *testing.T) {
+	x := gen(t, nil)
+	first := x.Routing.Rules[0]
+	if len(first.Domain) != 0 || len(first.Protocol) != 0 || first.Port != "" || first.Network != "" {
+		t.Errorf("the poison guard is narrowed by %+v; the poisoned answer arrives as a "+
+			"literal address with no domain to match on", first)
 	}
 }
 
@@ -474,7 +557,7 @@ func TestAutoResolvesDirectUntilEscalated(t *testing.T) {
 	if got := findRuleTagDomains(t, x, TagTunnel); len(got) > 0 {
 		t.Errorf("un-escalated auto rule produced tunnel rules: %v", got)
 	}
-	if includes := fakednsDomains(t, x); contains(includes, "voice.discord.gg") {
+	if includes := autoConfig(t, auto).TunnelIncludes(); contains(includes, "voice.discord.gg") {
 		t.Errorf("un-escalated auto rule is in the tunnel include list: %v", includes)
 	}
 
@@ -484,9 +567,24 @@ func TestAutoResolvesDirectUntilEscalated(t *testing.T) {
 	if got := findRuleTagDomains(t, x, TagTunnel); !contains(got, "voice.discord.gg") {
 		t.Errorf("escalated auto rule did not produce a tunnel rule; have %v", got)
 	}
-	if includes := fakednsDomains(t, x); !contains(includes, "voice.discord.gg") {
+	if includes := autoConfig(t, escalated).TunnelIncludes(); !contains(includes, "voice.discord.gg") {
 		t.Errorf("escalated auto rule missing from the tunnel include list: %v", includes)
 	}
+}
+
+// autoConfig normalises a one-rule configuration and returns it.
+//
+// The tunnel include list is read from the model rather than from the generated
+// document, because the fakedns domain list is no longer a mirror of it. They
+// used to be the same thing; now fakedns holds only the resolver's fronting
+// target while the include list holds the user's rules, and a test that read one
+// to check the other was checking nothing.
+func autoConfig(t *testing.T, r model.Rule) *model.Config {
+	t.Helper()
+	cfg := model.DefaultConfig()
+	cfg.Rules = []model.Rule{r}
+	cfg.Normalize()
+	return cfg
 }
 
 // TestDisabledRulesProduceNothing keeps a switched-off rule from quietly
