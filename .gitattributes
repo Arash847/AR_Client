@@ -1,0 +1,23 @@
+# Normalise to LF in the working tree.
+#
+# The hosted Windows runners check out with core.autocrlf on, which rewrites
+# every text file to CRLF. gofmt normalises to LF, so a CRLF checkout makes
+# `gofmt -l` report every file it touches and the formatting check fails on code
+# that is correctly formatted. That failure says nothing about the code, which
+# is the worst kind: it trains people to ignore the check.
+#
+# Pinning the line endings here means the same bytes arrive on every runner, so
+# the check reports formatting and only formatting.
+* text=auto eol=lf
+
+# These are read by PowerShell on Windows. LF is fine there, and keeping one rule
+# for everything is simpler than a rule that has to be remembered.
+*.ps1 text eol=lf
+*.yml text eol=lf
+*.md  text eol=lf
+
+# Binaries staged by the build, never committed.
+*.exe binary
+*.zip binary
+*.dat binary
+*.dll binary
