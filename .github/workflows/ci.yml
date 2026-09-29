@@ -1,0 +1,101 @@
+name: ci
+
+# Continuous integration exists here mostly to protect one thing: that the core
+# ARClient links against still understands the configuration it generates.
+#
+# The newest *tagged* xray-core release predates the fragment lengths/delays
+# arrays that the working FragB profile depends on, and the core's JSON loader
+# drops a field it does not recognise without complaint. A dependency bump
+# therefore produces a binary that starts, accepts the config, and fragments by
+# a different rule than the one that works — with no error anywhere. The test
+# that catches this is internal/engine.TestCorePreservesFragBFragmentLengths,
+# and it only runs if CI runs it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.27.1"
+
+jobs:
+  test:
+    name: test (windows)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify the pinned core is what go.mod claims
+        run: |
+          $pinned = (Select-String -Path go.mod -Pattern 'github.com/xtls/xray-core v(\S+)').Matches[0].Groups[1].Value
+          Write-Host "pinned xray-core: $pinned"
+          # A tagged release (v1.260327.0 and earlier) lacks the fragment
+          # lengths/delays arrays. Failing here with an explanation beats
+          # failing later on a user's machine as a client that cannot connect.
+          if ($pinned -notmatch '0\.0\.0-|260327\.1-0\.') {
+            Write-Error @"
+            xray-core is pinned to $pinned, which looks like a tagged release.
+
+            The fragment finalmask lengths/delays arrays this project depends on
+            arrived in XTLS/Xray-core PR #6334 and are not in any tagged release.
+            A tagged core silently ignores them.
+
+            Pin to a commit instead, for example:
+              go get github.com/xtls/xray-core@e5e85ca9dada936ae736197ad2b7a685972e8e0f
+            "@@
+            exit 1
+          }
+
+      - name: gofmt
+        run: |
+          $unformatted = gofmt -l .
+          if ($unformatted) {
+            Write-Error "gofmt needed:`n$($unformatted -join "`n")"
+            exit 1
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        # No -race: it needs cgo, and the hosted Windows runner has no C
+        # toolchain configured for it. The supervisor's locking is covered by
+        # the tests themselves rather than by the detector, which is the weaker
+        # of the two options available here.
+        run: go test -timeout 10m ./...
+
+      - name: Build
+        run: go build ./...
+
+  selftest-artifact:
+    name: selftest binary
+    runs-on: windows-2022
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The selftest is the instrument for the questions CI cannot answer,
+      # because it has to run on the target network. Producing it on every push
+      # means the answer is one download away rather than a local build.
+      - name: Build selftest
+        run: go build -trimpath -ldflags "-s -w" -o dist/ARClient-selftest.exe ./cmd/selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ARClient-selftest
+          path: dist/ARClient-selftest.exe
+          retention-days: 30

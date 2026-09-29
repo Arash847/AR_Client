@@ -1,0 +1,93 @@
+name: release
+
+# Builds the release archive. Nothing is built on a contributor's machine: the
+# cores are downloaded and checksum-verified here, the Go toolchain is pinned
+# here, and the resulting archive is the only artefact anyone installs.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      with_geo:
+        description: Stage geoip.dat and geosite.dat into the archive
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.27.1"
+  # Both cores are pinned. Bump these deliberately, one release at a time, and
+  # read the upstream notes: a change of transport behaviour is not something to
+  # discover in a user's release.
+  AETHER_VERSION: "v2.1.0"
+  ZEPTUN_VERSION: "v1.1.1"
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Stage the cores
+        shell: pwsh
+        run: |
+          ./scripts/fetch-cores.ps1 -AetherVersion $env:AETHER_VERSION -ZeptunVersion $env:ZEPTUN_VERSION `
+            $(if ('${{ inputs.with_geo }}' -eq 'true') { '-WithGeo' })
+
+      - name: go test
+        run: go test -timeout 10m ./...
+
+      - name: Build binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -trimpath -ldflags "-s -w" -o dist/ARClient.exe ./cmd/arclient
+          go build -trimpath -ldflags "-s -w" -o dist/ARClient-selftest.exe ./cmd/selftest
+
+      - name: Assemble the archive
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/', '' } else { "dev-$($env:GITHUB_RUN_NUMBER)" }
+          $stage = "stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item dist/ARClient.exe, dist/ARClient-selftest.exe $stage
+          Copy-Item cores/* $stage -Recurse
+          if (Test-Path geo) { Copy-Item geo $stage -Recurse }
+          Copy-Item README.md, docs/PLAN.md $stage
+
+          $zip = "ARClient-$version-win-x64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -CompressionLevel Optimal
+          Write-Host "built $zip ($([math]::Round((Get-Item $zip).Length/1MB,1)) MB)"
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ARClient-*-win-x64.zip
+          body: |
+            Windows build of ARClient.
+
+            Run `ARClient-selftest.exe` first. It reports whether the core starts,
+            what exit address each route presents, whether the tunnel carries UDP,
+            and whether UDP leaves the machine at all. Those answers decide
+            several parts of the design and cannot be obtained from CI, which has
+            no access to the target network.
+
+            Configuration lives in `%AppData%\ARClient\config.json` and is meant
+            to be edited by hand.
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ARClient-windows-x64
+          path: ARClient-*-win-x64.zip
+          retention-days: 30
