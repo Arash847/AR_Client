@@ -25,11 +25,15 @@ import (
 
 func main() {
 	var (
-		showConfig = flag.Bool("show-config", false, "print the generated core config and exit")
-		showTOML   = flag.Bool("show-zeptun", false, "print the generated tunnel config and exit")
-		probe      = flag.Bool("probe", false, "probe the running route and exit")
-		withTunnel = flag.Bool("tunnel", false, "also start Aether")
-		rawConfig  = flag.String("raw-config", "", "run this JSON config verbatim instead of a generated one (for A/B against an upstream reference)")
+		showConfig  = flag.Bool("show-config", false, "print the generated core config and exit")
+		showTOML    = flag.Bool("show-zeptun", false, "print the generated tunnel config and exit")
+		probe       = flag.Bool("probe", false, "probe the routes and exit")
+		withTunnel  = flag.Bool("tunnel", false, "also start Aether and probe through it")
+		rawConfig   = flag.String("raw-config", "", "run this JSON config verbatim instead of a generated one (for A/B against an upstream reference)")
+		aetherPeer  = flag.String("aether-peer", "", "pin the Aether gateway as ip:port and skip the scan")
+		aetherProto = flag.String("aether-protocol", "", "masque, wg, gool, tor or psiphon")
+		aetherH2    = flag.Bool("aether-h2", false, "carry MASQUE over HTTP/2 instead of HTTP/3")
+		hold        = flag.Duration("hold", 0, "exit automatically after this long; 0 waits for Ctrl-C")
 	)
 	flag.Parse()
 
@@ -99,21 +103,54 @@ func main() {
 		fmt.Printf("generated config: %s\n", p)
 	}
 
+	// The tunnel is started when asked for, and also whenever a rule actually
+	// needs it. Probing the tunnel with no tunnel rules in the configuration
+	// would report "no rules, skipping" even when the user explicitly asked for
+	// it, which reads as a refusal rather than as nothing to do.
 	var aether *engine.Aether
-	if *withTunnel {
-		if hasTunnelRules(cfg) {
-			a, err := engine.NewAether(binaryDir(), filepath.Join(st.Dir(), "aether"))
-			if err != nil {
-				fatal("%v", err)
+	tunnelRules := hasTunnelRules(cfg)
+	if *withTunnel && !tunnelRules {
+		fmt.Println("no tunnel rules configured; probing the tunnel anyway because --tunnel was given")
+	}
+	if tunnelRules || *withTunnel {
+		a, err := engine.NewAether(binaryDir(), filepath.Join(st.Dir(), "aether"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "aether unavailable: %v\n", err)
+			if !*withTunnel {
+				return
 			}
-			if err := a.Start(context.Background(), engine.DefaultAetherSettings()); err != nil {
-				fatal("%v", err)
-			}
-			defer a.Stop(5 * time.Second)
-			aether = a
-			fmt.Println("starting Aether...")
 		} else {
-			fmt.Println("no tunnel rules configured; not starting Aether")
+			settings := engine.DefaultAetherSettings()
+			if *aetherPeer != "" {
+				settings.Peer = *aetherPeer
+			}
+			if *aetherProto != "" {
+				settings.Protocol = engine.AetherProtocol(*aetherProto)
+			}
+			if *aetherH2 {
+				settings.HTTP2 = true
+			}
+			if err := settings.Validate(); err != nil {
+				fatal("%v", err)
+			}
+			fmt.Printf("starting Aether: %s peer=%s\n", settings.Protocol, orDash(settings.Peer))
+
+			if err := a.Start(context.Background(), settings); err != nil {
+				fmt.Fprintf(os.Stderr, "aether failed to start: %v\n", err)
+				if !*withTunnel {
+					return
+				}
+			} else {
+				aether = a
+				addr := fmt.Sprintf("127.0.0.1:%d", cfg.AetherPort)
+				fmt.Printf("waiting for %s (Aether holds the port closed until real data passes)\n", addr)
+				if err := a.WaitReady(addr, 120*time.Second); err != nil {
+					fmt.Fprintf(os.Stderr, "aether did not come up: %v\n", err)
+					drainAether(a)
+				} else {
+					fmt.Println("aether ready")
+				}
+			}
 		}
 	}
 
@@ -124,12 +161,32 @@ func main() {
 	}()
 
 	if *probe {
-		printProbe(cfg, addr)
+		printProbe(cfg, addr, aether)
 		return
 	}
 
+	if *hold > 0 {
+		fmt.Printf("running for %s, then exiting.\n", *hold)
+		time.Sleep(*hold)
+		fmt.Println("stopping")
+		return
+	}
 	fmt.Println("running. Ctrl-C to stop.")
 	waitForInterrupt()
+}
+
+// drainAether prints whatever the child produced, so a failure is diagnosable
+// without re-running it attached.
+func drainAether(a *engine.Aether) {
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case line := <-a.LogLines():
+			fmt.Println("  | " + line)
+		case <-deadline:
+			return
+		}
+	}
 }
 
 // logLines returns Aether's output, or a channel that never fires when Aether
@@ -141,10 +198,11 @@ func logLines(a *engine.Aether) <-chan string {
 	return a.LogLines()
 }
 
-func printProbe(cfg *model.Config, addr string) {
-	direct := health.Probe(context.Background(), "", 20*time.Second)
+func printProbe(cfg *model.Config, addr string, aether *engine.Aether) {
+	direct := health.Probe(context.Background(), "", 25*time.Second)
 	fmt.Printf("direct  %s\n", direct)
-	frag := health.Probe(context.Background(), addr, 20*time.Second)
+
+	frag := health.Probe(context.Background(), addr, 25*time.Second)
 	fmt.Printf("frag    %s\n", frag)
 	if frag.Reachable && direct.Reachable {
 		if frag.IsLocalExit(direct) {
@@ -153,6 +211,38 @@ func printProbe(cfg *model.Config, addr string) {
 			fmt.Printf("        -> frag exits elsewhere (%s vs %s)\n", frag.ExitIP, direct.ExitIP)
 		}
 	}
+	if aether == nil {
+		return
+	}
+
+	// Whether the tunnel will carry UDP decides whether voice can be routed
+	// through it at all, so it is reported before the tunnel is probed rather
+	// than as a separate exercise.
+	tunnelAddr := fmt.Sprintf("127.0.0.1:%d", cfg.AetherPort)
+	ua := health.ProbeUDPAssociate(tunnelAddr, 10*time.Second)
+	if ua.Supported {
+		fmt.Printf("udp     tunnel accepts UDP (relay %s)\n", ua.RelayAddr)
+	} else {
+		fmt.Printf("udp     tunnel will NOT carry UDP: %v\n", ua.Err)
+	}
+
+	tun := health.Probe(context.Background(), tunnelAddr, 25*time.Second)
+	fmt.Printf("tunnel  %s\n", tun)
+	if tun.Reachable && direct.Reachable {
+		if tun.IsLocalExit(direct) {
+			fmt.Println("        -> tunnel also presents your real IP")
+		} else {
+			fmt.Printf("        -> tunnel exits elsewhere (%s, country %s). Services that\n"+
+				"           refuse Iranian addresses will fail on this route.\n", tun.ExitIP, orDash(tun.ExitISO))
+		}
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func waitForInterrupt() {

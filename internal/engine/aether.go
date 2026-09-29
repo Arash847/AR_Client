@@ -70,6 +70,14 @@ type AetherSettings struct {
 	// QuickReconnect re-verifies the last working gateway instead of
 	// rescanning on every launch.
 	QuickReconnect bool `json:"quickReconnect"`
+	// Peer pins the gateway as address:port, skipping the scan entirely.
+	//
+	// Scanning is the slowest part of starting Aether and the part that varies
+	// most by network. A peer confirmed to work on the user's own connection
+	// turns startup into a single re-verification, with the scan kept as the
+	// fallback for when the pinned address stops answering. Measured on the
+	// target network: 162.159.198.1:443 answers for MASQUE over HTTP/3.
+	Peer string `json:"peer"`
 	// Bind is the SOCKS5 listen address.
 	Bind string `json:"bind"`
 }
@@ -77,6 +85,10 @@ type AetherSettings struct {
 // DefaultAetherSettings returns the settings ARClient ships with: MASQUE over
 // HTTP/3 with the firewall obfuscation profile, which is what the Aether
 // documentation recommends for this network.
+//
+// The peer is pinned to the address that was measured working on the target
+// network, so a normal start is one re-verification rather than a scan. Clear it
+// to fall back to scanning.
 func DefaultAetherSettings() AetherSettings {
 	return AetherSettings{
 		Protocol:       AetherMasque,
@@ -88,9 +100,13 @@ func DefaultAetherSettings() AetherSettings {
 		Tor:            false,
 		Psiphon:        false,
 		QuickReconnect: true,
+		Peer:           DefaultAetherPeer,
 		Bind:           "",
 	}
 }
+
+// DefaultAetherPeer is the gateway confirmed reachable on the target network.
+const DefaultAetherPeer = "162.159.198.1:443"
 
 // Args renders the settings as Aether's command line.
 //
@@ -139,6 +155,12 @@ func (s AetherSettings) Args() []string {
 	}
 	if s.QuickReconnect {
 		a = append(a, "--quick-reconnect")
+	}
+	if s.Peer != "" {
+		// Naming a peer suppresses the scan. The port is required: which port
+		// gets through is the part that differs by network, so there is no
+		// sensible default and none is invented here.
+		a = append(a, "--peer", s.Peer)
 	}
 	return a
 }
