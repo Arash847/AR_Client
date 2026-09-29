@@ -20,6 +20,7 @@ import (
 	"arclient/internal/engine"
 	"arclient/internal/health"
 	"arclient/internal/model"
+	"arclient/internal/netcfg"
 	"arclient/internal/store"
 )
 
@@ -34,8 +35,21 @@ func main() {
 		aetherProto = flag.String("aether-protocol", "", "masque, wg, gool, tor or psiphon")
 		aetherH2    = flag.Bool("aether-h2", false, "carry MASQUE over HTTP/2 instead of HTTP/3")
 		hold        = flag.Duration("hold", 0, "exit automatically after this long; 0 waits for Ctrl-C")
+		useProxy    = flag.Bool("system-proxy", false, "point the Windows system proxy at the core while running, and restore it on exit")
+		kill        = flag.Bool("off", false, "turn the system proxy off and exit; the panic path")
 	)
 	flag.Parse()
+
+	// The panic path deliberately bypasses everything else. It is the one command
+	// that has to work when nothing else does, so it must not depend on the
+	// configuration being valid, on a port being free, or on the core starting.
+	if *kill {
+		if err := netcfg.Clear(); err != nil {
+			fatal("%v", err)
+		}
+		fmt.Println("system proxy cleared.")
+		return
+	}
 
 	st, err := store.Open()
 	if err != nil {
@@ -160,6 +174,37 @@ func main() {
 		}
 	}()
 
+	// Capture. Without this the core listens on loopback and nothing connects,
+	// which looks exactly like the traffic being filtered and is not.
+	//
+	// The previous state is read before anything is changed, and restored on
+	// every exit path including a crash signal, because a system proxy pointing
+	// at a listener that no longer exists leaves the machine unable to reach
+	// anything through any proxy-aware application.
+	var restoreProxy func()
+	if *useProxy {
+		previous, err := netcfg.Read()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not read the current proxy settings: %v\n", err)
+		}
+		if err := netcfg.Set(addr); err != nil {
+			fatal("set system proxy: %v", err)
+		}
+		fmt.Printf("system proxy -> %s  (was %s)\n", addr, netcfg.Describe(previous))
+		restoreProxy = func() {
+			if err := netcfg.Restore(previous); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not restore the system proxy: %v\n", err)
+				fmt.Fprintf(os.Stderr, "run:  ARClient.exe --off\n")
+				return
+			}
+			fmt.Printf("system proxy restored to %s\n", netcfg.Describe(previous))
+		}
+		// Declared after the core's own shutdown, so it runs first: the proxy
+		// must never point at a listener that has already closed, not even for
+		// the moment between the two.
+		defer restoreProxy()
+	}
+
 	if *probe {
 		printProbe(cfg, addr, aether)
 		return
@@ -172,7 +217,24 @@ func main() {
 		return
 	}
 	fmt.Println("running. Ctrl-C to stop.")
-	waitForInterrupt()
+	waitForInterrupt(restoreProxy)
+}
+
+// waitForInterrupt blocks until the user asks to stop.
+//
+// The restore runs on the signal path as well as through the deferred call,
+// because a process killed with Ctrl-C that skips it leaves the machine's proxy
+// pointing at a listener that has just gone away. Doing the restore in both
+// places is harmless — the second is a no-op — while missing it in either is an
+// outage.
+func waitForInterrupt(restore func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	<-ch
+	fmt.Println("\nstopping")
+	if restore != nil {
+		restore()
+	}
 }
 
 // drainAether prints whatever the child produced, so a failure is diagnosable
@@ -243,13 +305,6 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-func waitForInterrupt() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	<-ch
-	fmt.Println("\nstopping")
 }
 
 func hasTunnelRules(cfg *model.Config) bool {

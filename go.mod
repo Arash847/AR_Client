@@ -2,7 +2,10 @@ module arclient
 
 go 1.27
 
-require github.com/xtls/xray-core v1.260327.1-0.20260927233921-e5e85ca9dada
+require (
+	github.com/xtls/xray-core v1.260327.1-0.20260927233921-e5e85ca9dada
+	golang.org/x/sys v0.48.0
+)
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
@@ -41,7 +44,6 @@ require (
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
