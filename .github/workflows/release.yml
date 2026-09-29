@@ -39,9 +39,16 @@ jobs:
 
       - name: Stage the cores
         shell: pwsh
+        env:
+          WITH_GEO: ${{ inputs.with_geo }}
         run: |
-          ./scripts/fetch-cores.ps1 -AetherVersion $env:AETHER_VERSION -ZeptunVersion $env:ZEPTUN_VERSION `
-            $(if ('${{ inputs.with_geo }}' -eq 'true') { '-WithGeo' })
+          # -WithGeo only when the input is set. Built as an argument array rather
+          # than interpolated into the command line, because a single-quoted
+          # string in PowerShell does not expand $(...) and the flag would
+          # silently never be passed.
+          $coreArgs = @('-AetherVersion', $env:AETHER_VERSION, '-ZeptunVersion', $env:ZEPTUN_VERSION)
+          if ($env:WITH_GEO -eq 'true') { $coreArgs += '-WithGeo' }
+          ./scripts/fetch-cores.ps1 @coreArgs
 
       - name: go test
         run: go test -timeout 10m ./...

@@ -35,24 +35,28 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Verify the pinned core is what go.mod claims
+      - name: Verify the pinned core is a commit, not a tag
+        shell: pwsh
         run: |
-          $pinned = (Select-String -Path go.mod -Pattern 'github.com/xtls/xray-core v(\S+)').Matches[0].Groups[1].Value
+          $pinned = (go list -m github.com/xtls/xray-core) -replace '^github.com/xtls/xray-core\s+', ''
           Write-Host "pinned xray-core: $pinned"
-          # A tagged release (v1.260327.0 and earlier) lacks the fragment
-          # lengths/delays arrays. Failing here with an explanation beats
-          # failing later on a user's machine as a client that cannot connect.
-          if ($pinned -notmatch '0\.0\.0-|260327\.1-0\.') {
-            Write-Error @"
-            xray-core is pinned to $pinned, which looks like a tagged release.
 
-            The fragment finalmask lengths/delays arrays this project depends on
-            arrived in XTLS/Xray-core PR #6334 and are not in any tagged release.
-            A tagged core silently ignores them.
-
-            Pin to a commit instead, for example:
-              go get github.com/xtls/xray-core@e5e85ca9dada936ae736197ad2b7a685972e8e0f
-            "@@
+          # A pseudo-version carries the -0.<timestamp>-<sha> segment that marks
+          # a commit rather than a release. Matching on that shape rather than on
+          # a list of known-good tags means a future tag is rejected by default
+          # instead of having to be recognised.
+          if ($pinned -notmatch '-0\.\d{14}-[0-9a-f]{12}$') {
+            Write-Host ""
+            Write-Host "FAIL: xray-core is pinned to a tagged release."
+            Write-Host ""
+            Write-Host "The fragment finalmask lengths/delays arrays this project depends on"
+            Write-Host "arrived in XTLS/Xray-core PR #6334 and are in no tagged release. A"
+            Write-Host "tagged core silently ignores them: it starts, accepts the config, and"
+            Write-Host "fragments by a different rule than the one that works. There is no"
+            Write-Host "error. The only symptom is a client that loads and cannot connect."
+            Write-Host ""
+            Write-Host "Pin a commit instead:"
+            Write-Host "  go get github.com/xtls/xray-core@e5e85ca9dada936ae736197ad2b7a685972e8e0f"
             exit 1
           }
 
